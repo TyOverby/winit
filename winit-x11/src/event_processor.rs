@@ -1096,9 +1096,9 @@ impl EventProcessor {
             let idx = i as i32;
 
             if Some(idx) == tablet_axes.pressure_idx {
-                // Normalize pressure to 0.0-1.0 range
-                // Most tablets report pressure in a range, we'll assume 0.0-1.0 already
-                data.force = Some(Force::Normalized(val.max(0.0).min(1.0)));
+                // Pass through raw pressure value to see actual device range
+                // Don't normalize yet - we need to discover the actual min/max values
+                data.force = Some(Force::Normalized(val as f64));
             } else if Some(idx) == tablet_axes.tilt_x_idx {
                 // Tilt is reported in degrees, clamp to -90..90 and convert to i8
                 tilt_x = Some((val.max(-90.0).min(90.0)) as i8);
