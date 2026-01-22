@@ -999,13 +999,21 @@ pub(crate) fn mkdid(w: xinput::DeviceId) -> DeviceId {
 pub struct Device {
     _name: String,
     pub(crate) scroll_axes: Vec<(i32, ScrollAxis)>,
+    pub(crate) tablet_axes: Option<TabletAxes>,
     // For master devices, this is the paired device (pointer <-> keyboard).
     // For slave devices, this is the master.
     pub(crate) attachment: c_int,
     pub(crate) r#type: DeviceType,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TabletAxes {
+    pub(crate) pressure_idx: Option<i32>,
+    pub(crate) tilt_x_idx: Option<i32>,
+    pub(crate) tilt_y_idx: Option<i32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum DeviceType {
     Mouse,
     Touch,
@@ -1031,9 +1039,14 @@ impl Device {
         let name = unsafe { CStr::from_ptr(info.name).to_string_lossy() };
         let mut scroll_axes = Vec::new();
         let mut r#type = None;
+        let mut tablet_axes = TabletAxes {
+            pressure_idx: None,
+            tilt_x_idx: None,
+            tilt_y_idx: None,
+        };
 
         if Device::physical_device(info) {
-            // Identify scroll axes
+            // Identify scroll axes and device type
             for &class_ptr in Device::classes(info) {
                 let ty = unsafe { (*class_ptr)._type };
                 if ty == ffi::XIScrollClass {
@@ -1067,11 +1080,37 @@ impl Device {
                     }
                 }
             }
+
+            // If this is a tablet device, record tablet axis indices
+            if matches!(r#type, Some(DeviceType::Pen) | Some(DeviceType::Eraser)) {
+                for &class_ptr in Device::classes(info) {
+                    let ty = unsafe { (*class_ptr)._type };
+                    if ty == ffi::XIValuatorClass {
+                        let vinfo = unsafe { &*(class_ptr as *const ffi::XIValuatorClassInfo) };
+                        let atom = vinfo.label as xproto::Atom;
+
+                        if atom == atoms[ABS_PRESSURE] {
+                            tablet_axes.pressure_idx = Some(vinfo.number);
+                        } else if atom == atoms[ABS_TILT_X] {
+                            tablet_axes.tilt_x_idx = Some(vinfo.number);
+                        } else if atom == atoms[ABS_TILT_Y] {
+                            tablet_axes.tilt_y_idx = Some(vinfo.number);
+                        }
+                    }
+                }
+            }
         }
+
+        let tablet_axes_opt = if matches!(r#type, Some(DeviceType::Pen) | Some(DeviceType::Eraser)) {
+            Some(tablet_axes)
+        } else {
+            None
+        };
 
         let mut device = Device {
             _name: name.into_owned(),
             scroll_axes,
+            tablet_axes: tablet_axes_opt,
             attachment: info.attachment,
             r#type: r#type.unwrap_or(DeviceType::Mouse),
         };

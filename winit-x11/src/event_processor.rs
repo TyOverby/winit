@@ -8,9 +8,9 @@ use dpi::{PhysicalPosition, PhysicalSize};
 use winit_common::xkb::{self, Context, XkbState};
 use winit_core::application::ApplicationHandler;
 use winit_core::event::{
-    ButtonSource, DeviceEvent, DeviceId, ElementState, FingerId, Ime, MouseButton,
-    MouseScrollDelta, PointerKind, PointerSource, RawKeyEvent, SurfaceSizeWriter, TouchPhase,
-    WindowEvent,
+    ButtonSource, DeviceEvent, DeviceId, ElementState, FingerId, Force, Ime, MouseButton,
+    MouseScrollDelta, PointerKind, PointerSource, RawKeyEvent, SurfaceSizeWriter,
+    TabletToolData, TabletToolKind, TabletToolTilt, TouchPhase, WindowEvent,
 };
 use winit_core::keyboard::ModifiersState;
 use winit_core::window::WindowId;
@@ -976,13 +976,16 @@ impl EventProcessor {
         // Set the timestamp.
         self.target.xconn.set_timestamp(event.time as xproto::Timestamp);
 
-        let Some(DeviceType::Mouse) = self
+        let device_type = self
             .devices
             .borrow()
             .get(&mkdid(event.sourceid as xinput::DeviceId))
-            .map(|device| device.r#type)
-        else {
-            return;
+            .map(|device| device.r#type);
+
+        // Only handle Mouse, Pen, and Eraser devices
+        let device_type = match device_type {
+            Some(DeviceType::Mouse) | Some(DeviceType::Pen) | Some(DeviceType::Eraser) => device_type.unwrap(),
+            _ => return,
         };
 
         // Deliver multi-touch events instead of emulated mouse events.
@@ -1015,11 +1018,12 @@ impl EventProcessor {
                 button: MouseButton::Right.into(),
             },
 
-            // Suppress emulated scroll wheel clicks, since we handle the real motion events for
+            // Suppress emulated scroll wheel clicks for mice, since we handle the real motion events for
             // those. In practice, even clicky scroll wheels appear to be reported by
             // evdev (and XInput2 in turn) as axis motion, so we don't otherwise
             // special-case these button presses.
-            4..=7 => match state {
+            // For tablets, these are regular buttons so we don't special-case them.
+            4..=7 if device_type == DeviceType::Mouse => match state {
                 ElementState::Pressed => WindowEvent::MouseWheel {
                     device_id,
                     delta: match event.detail {
@@ -1032,6 +1036,15 @@ impl EventProcessor {
                     phase: TouchPhase::Moved,
                 },
                 ElementState::Released => return,
+            },
+
+            // For tablets, buttons 4-7 are regular buttons
+            x @ 4..=7 if matches!(device_type, DeviceType::Pen | DeviceType::Eraser) => WindowEvent::PointerButton {
+                device_id,
+                primary: true,
+                state,
+                position,
+                button: MouseButton::try_from_u8((x - 1) as u8).unwrap().into(),
             },
 
             x @ 8..37 => WindowEvent::PointerButton {
@@ -1057,17 +1070,71 @@ impl EventProcessor {
         app.window_event(&self.target, window_id, event);
     }
 
+    /// Extract tablet data (pressure, tilt, etc.) from valuators
+    fn extract_tablet_data(&self, event: &XIDeviceEvent, device: &Device) -> TabletToolData {
+        let mut data = TabletToolData::default();
+
+        let tablet_axes = match &device.tablet_axes {
+            Some(axes) => axes,
+            None => return data,
+        };
+
+        let mask = unsafe {
+            slice::from_raw_parts(event.valuators.mask, event.valuators.mask_len as usize)
+        };
+
+        let mut tilt_x: Option<i8> = None;
+        let mut tilt_y: Option<i8> = None;
+
+        let mut value = event.valuators.values;
+        for i in 0..event.valuators.mask_len * 8 {
+            if !xinput2::XIMaskIsSet(mask, i) {
+                continue;
+            }
+
+            let val = unsafe { *value };
+            let idx = i as i32;
+
+            if Some(idx) == tablet_axes.pressure_idx {
+                // Normalize pressure to 0.0-1.0 range
+                // Most tablets report pressure in a range, we'll assume 0.0-1.0 already
+                data.force = Some(Force::Normalized(val.max(0.0).min(1.0)));
+            } else if Some(idx) == tablet_axes.tilt_x_idx {
+                // Tilt is reported in degrees, clamp to -90..90 and convert to i8
+                tilt_x = Some((val.max(-90.0).min(90.0)) as i8);
+            } else if Some(idx) == tablet_axes.tilt_y_idx {
+                // Tilt is reported in degrees, clamp to -90..90 and convert to i8
+                tilt_y = Some((val.max(-90.0).min(90.0)) as i8);
+            }
+
+            value = unsafe { value.offset(1) };
+        }
+
+        // Construct TabletToolTilt if we have at least one tilt value
+        if tilt_x.is_some() || tilt_y.is_some() {
+            data.tilt = Some(TabletToolTilt {
+                x: tilt_x.unwrap_or(0),
+                y: tilt_y.unwrap_or(0),
+            });
+        }
+
+        data
+    }
+
     fn xinput2_mouse_motion(&self, event: &XIDeviceEvent, app: &mut dyn ApplicationHandler) {
         // Set the timestamp.
         self.target.xconn.set_timestamp(event.time as xproto::Timestamp);
 
-        let Some(DeviceType::Mouse) = self
+        let device_type = self
             .devices
             .borrow()
             .get(&mkdid(event.sourceid as xinput::DeviceId))
-            .map(|device| device.r#type)
-        else {
-            return;
+            .map(|device| device.r#type);
+
+        // Only handle Mouse, Pen, and Eraser devices
+        let device_type = match device_type {
+            Some(DeviceType::Mouse) | Some(DeviceType::Pen) | Some(DeviceType::Eraser) => device_type.unwrap(),
+            _ => return,
         };
 
         let device_id = Some(mkdid(event.deviceid as xinput::DeviceId));
@@ -1083,58 +1150,84 @@ impl EventProcessor {
         if cursor_moved == Some(true) {
             let position = PhysicalPosition::new(event.event_x, event.event_y);
 
+            // Determine pointer source based on device type
+            let source = match device_type {
+                DeviceType::Mouse => PointerSource::Mouse,
+                DeviceType::Pen => {
+                    let devices = self.devices.borrow();
+                    let device = devices.get(&mkdid(event.sourceid as xinput::DeviceId));
+                    let data = device.map(|d| self.extract_tablet_data(event, d)).unwrap_or_default();
+                    PointerSource::TabletTool {
+                        kind: TabletToolKind::Pen,
+                        data,
+                    }
+                },
+                DeviceType::Eraser => {
+                    let devices = self.devices.borrow();
+                    let device = devices.get(&mkdid(event.sourceid as xinput::DeviceId));
+                    let data = device.map(|d| self.extract_tablet_data(event, d)).unwrap_or_default();
+                    PointerSource::TabletTool {
+                        kind: TabletToolKind::Eraser,
+                        data,
+                    }
+                },
+                _ => unreachable!(),
+            };
+
             let event = WindowEvent::PointerMoved {
                 device_id,
                 primary: true,
                 position,
-                source: PointerSource::Mouse,
+                source,
             };
             app.window_event(&self.target, window_id, event);
         } else if cursor_moved.is_none() {
             return;
         }
 
-        // More gymnastics, for self.devices
-        let mask = unsafe {
-            slice::from_raw_parts(event.valuators.mask, event.valuators.mask_len as usize)
-        };
-        let mut devices = self.devices.borrow_mut();
-        let physical_device = match devices.get_mut(&mkdid(event.sourceid as xinput::DeviceId)) {
-            Some(device) => device,
-            None => return,
-        };
+        // Handle scroll events for mice
+        if device_type == DeviceType::Mouse {
+            let mask = unsafe {
+                slice::from_raw_parts(event.valuators.mask, event.valuators.mask_len as usize)
+            };
+            let mut devices = self.devices.borrow_mut();
+            let physical_device = match devices.get_mut(&mkdid(event.sourceid as xinput::DeviceId)) {
+                Some(device) => device,
+                None => return,
+            };
 
-        let mut events = Vec::new();
-        let mut value = event.valuators.values;
-        for i in 0..event.valuators.mask_len * 8 {
-            if !xinput2::XIMaskIsSet(mask, i) {
-                continue;
+            let mut events = Vec::new();
+            let mut value = event.valuators.values;
+            for i in 0..event.valuators.mask_len * 8 {
+                if !xinput2::XIMaskIsSet(mask, i) {
+                    continue;
+                }
+
+                let x = unsafe { *value };
+
+                if let Some(&mut (_, ref mut info)) =
+                    physical_device.scroll_axes.iter_mut().find(|&&mut (axis, _)| axis == i as _)
+                {
+                    let delta = (x - info.position) / info.increment;
+                    info.position = x;
+                    // X11 vertical scroll coordinates are opposite to winit's
+                    let delta = match info.orientation {
+                        ScrollOrientation::Horizontal => {
+                            MouseScrollDelta::LineDelta(-delta as f32, 0.0)
+                        },
+                        ScrollOrientation::Vertical => MouseScrollDelta::LineDelta(0.0, -delta as f32),
+                    };
+
+                    let event = WindowEvent::MouseWheel { device_id, delta, phase: TouchPhase::Moved };
+                    events.push(event);
+                }
+
+                value = unsafe { value.offset(1) };
             }
 
-            let x = unsafe { *value };
-
-            if let Some(&mut (_, ref mut info)) =
-                physical_device.scroll_axes.iter_mut().find(|&&mut (axis, _)| axis == i as _)
-            {
-                let delta = (x - info.position) / info.increment;
-                info.position = x;
-                // X11 vertical scroll coordinates are opposite to winit's
-                let delta = match info.orientation {
-                    ScrollOrientation::Horizontal => {
-                        MouseScrollDelta::LineDelta(-delta as f32, 0.0)
-                    },
-                    ScrollOrientation::Vertical => MouseScrollDelta::LineDelta(0.0, -delta as f32),
-                };
-
-                let event = WindowEvent::MouseWheel { device_id, delta, phase: TouchPhase::Moved };
-                events.push(event);
+            for event in events {
+                app.window_event(&self.target, window_id, event);
             }
-
-            value = unsafe { value.offset(1) };
-        }
-
-        for event in events {
-            app.window_event(&self.target, window_id, event);
         }
     }
 
