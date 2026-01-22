@@ -1009,6 +1009,8 @@ pub struct Device {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TabletAxes {
     pub(crate) pressure_idx: Option<i32>,
+    pub(crate) pressure_min: f64,
+    pub(crate) pressure_max: f64,
     pub(crate) tilt_x_idx: Option<i32>,
     pub(crate) tilt_y_idx: Option<i32>,
 }
@@ -1041,6 +1043,8 @@ impl Device {
         let mut r#type = None;
         let mut tablet_axes = TabletAxes {
             pressure_idx: None,
+            pressure_min: 0.0,
+            pressure_max: 1.0,
             tilt_x_idx: None,
             tilt_y_idx: None,
         };
@@ -1091,6 +1095,8 @@ impl Device {
 
                         if atom == atoms[ABS_PRESSURE] {
                             tablet_axes.pressure_idx = Some(vinfo.number);
+                            tablet_axes.pressure_min = vinfo.min;
+                            tablet_axes.pressure_max = vinfo.max;
                         } else if atom == atoms[ABS_TILT_X] {
                             tablet_axes.tilt_x_idx = Some(vinfo.number);
                         } else if atom == atoms[ABS_TILT_Y] {
